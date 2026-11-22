@@ -1,0 +1,110 @@
+name: Build IPA (Telegram iOS до Liquid Glass)
+
+on:
+  workflow_dispatch:
+    inputs:
+      before_date:
+        description: "Взять последний коммит Telegram-iOS ДО этой даты (YYYY-MM-DD)"
+        default: "2025-10-10"
+      bundle_id:
+        description: "Bundle ID приложения"
+        default: "com.dzas0w.gramm"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - name: Checkout builder repo (патчи)
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Clone Telegram-iOS and checkout old commit
+        run: |
+          git clone https://github.com/TelegramMessenger/Telegram-iOS.git telegram
+          cd telegram
+          COMMIT=$(git rev-list -1 --before="${{ inputs.before_date }} 00:00" HEAD)
+          echo "Using commit: $COMMIT"
+          git log -1 --format='%H %ad %s' "$COMMIT"
+          git checkout "$COMMIT"
+          git submodule update --init --recursive -j8
+
+      - name: Apply patches (covers etc.)
+        run: |
+          cd telegram
+          shopt -s nullglob
+          for p in ../builder/patches/*.patch; do
+            echo "Applying $p"
+            git apply "$p"
+          done
+
+      - name: Rename app to dzas0wGRAMM
+        run: |
+          cd telegram
+          NAME="dzas0wGRAMM"
+          echo "--- где в проекте задано имя приложения ---"
+          grep -rn --include=BUILD --include=*.bzl --include=Info.plist -E 'APP_NAME|CFBundleDisplayName|CFBundleName' Telegram | head -30 || true
+          # Подмена значения APP_NAME в Bazel-файле приложения (если оно там задано)
+          if [ -f Telegram/BUILD ]; then
+            sed -i '' -E "s/(\"APP_NAME\" *: *)\"Telegram\"/\1\"$NAME\"/" Telegram/BUILD || true
+          fi
+          # Подмена литерального имени в Info.plist основного приложения
+          for f in Telegram/Telegram-iOS/Resources/Info.plist Telegram/Telegram-iOS/Info.plist; do
+            if [ -f "$f" ]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $NAME" "$f" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Set :CFBundleName $NAME" "$f" 2>/dev/null || true
+            fi
+          done
+          echo "--- после замены ---"
+          grep -rn --include=BUILD -E 'APP_NAME' Telegram | head -10 || true
+
+      - name: Select Xcode
+        run: |
+          cd telegram
+          WANT=$(python3 -c "import json;print(json.load(open('versions.json')).get('xcode',''))" 2>/dev/null || true)
+          echo "versions.json wants Xcode: $WANT"
+          ls /Applications | grep -i xcode || true
+          if [ -n "$WANT" ] && ls -d /Applications/Xcode_${WANT}*.app >/dev/null 2>&1; then
+            sudo xcode-select -s "$(ls -d /Applications/Xcode_${WANT}*.app | head -1)"
+          fi
+          xcodebuild -version
+
+      - name: Prepare configuration
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          cd telegram
+          SRC=build-system/template_minimal_development_configuration.json
+          [ -f "$SRC" ] || SRC=build-system/appstore-configuration.json
+          jq --arg b "${{ inputs.bundle_id }}" --arg i "$API_ID" --arg h "$API_HASH" \
+            '.bundle_id=$b | .api_id=$i | .api_hash=$h | .team_id="0000000000"' \
+            "$SRC" > "$GITHUB_WORKSPACE/config.json"
+          echo "Config keys:"; jq 'keys' "$GITHUB_WORKSPACE/config.json"
+
+      - name: Build IPA
+        run: |
+          cd telegram
+          python3 build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath="$GITHUB_WORKSPACE/config.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=100001 \
+            --configuration=release_arm64
+
+      - name: Collect IPA
+        run: |
+          mkdir -p out
+          find -L telegram/bazel-bin -name "*.ipa" -exec cp {} out/ \; 2>/dev/null || true
+          find telegram -maxdepth 3 -name "*.ipa" -exec cp {} out/ \; 2>/dev/null || true
+          ls -la out
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-ipa
+          path: out/*.ipa
+          if-no-files-found: error
