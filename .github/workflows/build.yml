@@ -72,8 +72,8 @@ jobs:
 
       - name: Prepare configuration
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
+          API_ID: ${{ 7848805 }}
+          API_HASH: ${{ 2dd5e2f54ebf7dcecd0fd4bab450fe23 }}
         run: |
           cd telegram
           SRC=build-system/template_minimal_development_configuration.json
